@@ -1075,6 +1075,7 @@ class ServerArgs:
                 "fa3",
                 "flashinfer",
                 "flashmla",
+                "npumla",
                 "intel_amx",
                 "torch_native",
                 "triton",
