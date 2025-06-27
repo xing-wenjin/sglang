@@ -191,6 +191,7 @@ class DecodePreallocQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.kv_data_first = self.token_to_kv_pool.get_key_buffer(0)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -208,6 +209,7 @@ class DecodePreallocQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        kv_args.aux_datas = self.metadata_buffers.get_bufs()
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
