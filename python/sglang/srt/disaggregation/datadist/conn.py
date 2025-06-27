@@ -1,4 +1,5 @@
 import dataclasses
+import logging
 import os
 import re
 import subprocess
@@ -19,12 +20,45 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_by_remote
 
+logger = logging.getLogger(__name__)
+
+GUARD = "DataDistMsgGuard".encode("ascii")
 
 @dataclasses.dataclass
 class TransferInfo:
-    # todo 握手信息定义
-    pass
+    # handshake info, params to be fixed, same as nixl temporary
+    room: int
+    endpoint: str
+    dst_port: int
+    agent_metadata: bytes
+    agent_name: str
+    dst_kv_ptrs: list[int]
+    dst_kv_indices: npt.NDArray[np.int32]
+    dst_aux_ptrs: list[int]
+    dst_aux_index: int
+    dst_gpu_id: int
+    required_dst_info_num: int
+    cache_id: int
 
+    def is_dummy(self):
+        return self.dst_kv_indices.size == 0
+    
+    @classmethod
+    def from_zmq(cls, msg:List[bytes], cid: int) -> "TransferInfo":
+        return cls(
+            room=int(msg[0].decode("ascii")),
+            endpoint=msg[1].decode("ascii"),
+            dst_port=int(msg[2].decode("ascii")),
+            agent_metadata=msg[3]
+            agent_name=msg[4].decode("ascii"),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_indices=np.frombuffer(msg[6], dtype=np.int32),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[7])//8}Q", msg[7])),
+            dst_aux_index=int(msg[8].decode("ascii")),
+            dst_gpu_id=int(msg[9].decode("ascii")),
+            required_dst_info_num=int(msg[10].decode("ascii")),
+            cache_id = cid
+        )
 
 def get_device_ips():
     world_size = 8
@@ -107,6 +141,10 @@ class DataDistKVManager(CommonKVManager):
         self.cache_manager = self.llm_datadist.cache_manager
         self.register_buffer_to_engine()
 
+        #save cache_id, by RegisterKvCache --> cache_id: int
+        # self.cache_id = llm_datadist.RegisterKvCache()
+        self.cache_id = -1
+
         # P侧创建zmq监听，接受D侧的握手信息
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.server_socket = zmq.Context().socket(zmq.PULL)
@@ -155,9 +193,33 @@ class DataDistKVManager(CommonKVManager):
         self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
 
         def bootstrap_thread():
+
             while True:
-                # todo 接收receiver发送的握手消息
-                pass
+                # receive and process handshake msg from KVReceiver bootstrap thread
+                waiting_req_bytes = self.server_socket.recv_multipart()
+                logger.debug(
+                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
+                )
+                assert (
+                    waiting_req_bytes[0] = GUARD
+                ), f"First message should be {GUARD}, Foreign traffic?"
+                waiting_req_bytes = waiting_req_byte[1:]
+                room = waiting_req_bytes[0].decode("ascii")
+
+                required_dst_info_num = int(waiting_req_bytes[10].decode("ascii"))
+                room = int(room)
+                agent_name = waiting_req_bytes[4].decode("ascii")
+                if room not in self.transfer_infos:
+                    self.transfer_infos[room] = {}
+                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
+                    waiting_req_bytes,
+                    self.cache_id
+                )
+
+                logger.debug(f"got info {room=}{agent_name=} {required_dst_info_num=}")
+                if len(self.transfer_infos[room]) == required_dst_info_num:
+                    logger.debug(f"{room=} is bootstrapped")
+                    self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
 
@@ -185,7 +247,46 @@ class DataDistKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
-        pass
+        for bootstrap_info in self.bootstrap_infos:
+            self.prefill_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['ank_port']}"
+            )
+            logger.debug(
+                f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+            )
+            is_dummy = bootstrap_info["is_dummy"]
+
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+
+            logger.debug(
+                f"Sending to {self.prefill_server_url} with bootstrap room {self.bootstrap_room}"
+            )
+            sock, lock = self._connect("tcp://" + self.prefill_server_url)
+
+            while lock:
+                sock.send_multipart(
+                    [
+                        GUARD,
+                        str(self.bootstrap_room).encode("ascii"),
+                        get_local_ip_by_remote().encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.kv_mgr.agent.get_agent_metadata(),
+                        self.kv_mgr.agent.name.encode("ascii"),
+                        packed_kv_data_ptrs,
+                        kv_indices.tobytes() if not is_dummy else b"",
+                        packed_aux_data_ptrs
+                        str(aux_index).encode("ascii"),
+                        str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+                        str(self.required_dst_info_num).encode("ascii"),
+                    ]
+                )
+
+        self.started_transfer = True    
 
     def poll(self) -> KVPoll:
         pass
