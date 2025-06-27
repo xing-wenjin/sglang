@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import os
 import re
+import struct
 import subprocess
 import threading
 from typing import Optional, Dict, List
@@ -10,7 +11,7 @@ import llm_datadist
 import numpy as np
 import torch
 import zmq
-from llm_datadist import CacheDesc, BlocksCacheKey
+from llm_datadist import CacheDesc, BlocksCacheKey, Cache
 from llm_datadist import LLMDataDist, LLMRole, LLMConfig
 from numpy import typing as npt
 
@@ -23,6 +24,7 @@ from sglang.srt.utils import get_local_ip_by_remote
 logger = logging.getLogger(__name__)
 
 GUARD = "DataDistMsgGuard".encode("ascii")
+
 
 @dataclasses.dataclass
 class TransferInfo:
@@ -42,23 +44,24 @@ class TransferInfo:
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
-    
+
     @classmethod
-    def from_zmq(cls, msg:List[bytes], cid: int) -> "TransferInfo":
+    def from_zmq(cls, msg: List[bytes], cid: int) -> "TransferInfo":
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
-            agent_metadata=msg[3]
+            agent_metadata=msg[3],
             agent_name=msg[4].decode("ascii"),
-            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5])),
             dst_kv_indices=np.frombuffer(msg[6], dtype=np.int32),
-            dst_aux_ptrs=list(struct.unpack(f"{len(msg[7])//8}Q", msg[7])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[7]) // 8}Q", msg[7])),
             dst_aux_index=int(msg[8].decode("ascii")),
             dst_gpu_id=int(msg[9].decode("ascii")),
             required_dst_info_num=int(msg[10].decode("ascii")),
-            cache_id = cid
+            cache_id=cid
         )
+
 
 def get_device_ips():
     world_size = 8
@@ -111,7 +114,7 @@ class DataDistKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
-        self.registered_kv_caches = []
+        self.registered_kv_caches: List[Cache] = []
         self.cluster_id = 0  # todo 根据dp_rank确定
         self.device_ip_list = get_device_ips()
         self.local_device_ip = self.device_ip_list[self.kv_args.gpu_id]
@@ -141,9 +144,7 @@ class DataDistKVManager(CommonKVManager):
         self.cache_manager = self.llm_datadist.cache_manager
         self.register_buffer_to_engine()
 
-        #save cache_id, by RegisterKvCache --> cache_id: int
-        # self.cache_id = llm_datadist.RegisterKvCache()
-        self.cache_id = -1
+        self.cache_id = self.registered_kv_caches[0].cache_id
 
         # P侧创建zmq监听，接受D侧的握手信息
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -201,9 +202,9 @@ class DataDistKVManager(CommonKVManager):
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
                 assert (
-                    waiting_req_bytes[0] = GUARD
+                    waiting_req_bytes[0] == GUARD
                 ), f"First message should be {GUARD}, Foreign traffic?"
-                waiting_req_bytes = waiting_req_byte[1:]
+                waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
 
                 required_dst_info_num = int(waiting_req_bytes[10].decode("ascii"))
@@ -279,14 +280,14 @@ class DataDistKVReceiver(CommonKVReceiver):
                         self.kv_mgr.agent.name.encode("ascii"),
                         packed_kv_data_ptrs,
                         kv_indices.tobytes() if not is_dummy else b"",
-                        packed_aux_data_ptrs
+                        packed_aux_data_ptrs,
                         str(aux_index).encode("ascii"),
                         str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
 
-        self.started_transfer = True    
+        self.started_transfer = True
 
     def poll(self) -> KVPoll:
         pass
