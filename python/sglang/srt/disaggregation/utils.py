@@ -263,6 +263,7 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
     elif transfer_backend == TransferBackend.LLMDATADIST:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.datadist import (
+            DataDistKVArgs,
             DataDistKVManager,
             DataDistKVSender,
             DataDistKVReceiver,
@@ -270,7 +271,7 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
         )
 
         class_mapping = {
-            KVClassType.KVARGS: KVArgs,
+            KVClassType.KVARGS: DataDistKVArgs,
             KVClassType.MANAGER: DataDistKVManager,
             KVClassType.SENDER: DataDistKVSender,
             KVClassType.RECEIVER: DataDistKVReceiver,

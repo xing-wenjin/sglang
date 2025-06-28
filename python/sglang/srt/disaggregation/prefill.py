@@ -91,6 +91,7 @@ class PrefillBootstrapQueue:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.gpu_id = gpu_id
+        self.dp_rank = scheduler.dp_rank
         self.bootstrap_port = bootstrap_port
         self.queue: List[Req] = []
         self.gloo_group = gloo_group
@@ -102,6 +103,10 @@ class PrefillBootstrapQueue:
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
+
+        # pass dp_rank in kv_manager initialization
+        if self.transfer_backend == TransferBackend.LLMDATADIST:
+            kv_args.dp_rank = self.dp_rank
         kv_args.engine_rank = self.tp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size

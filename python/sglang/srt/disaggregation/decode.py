@@ -169,6 +169,7 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.dp_size = dp_size
         self.gpu_id = gpu_id
+        self.dp_rank = scheduler.dp_rank
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.prefill_pp_size = prefill_pp_size
@@ -184,6 +185,9 @@ class DecodePreallocQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
+        # pass dp_rank in kv_manager initialization
+        if self.transfer_backend == TransferBackend.LLMDATADIST:
+            kv_args.dp_rank = self.dp_rank
         attn_tp_size = self.tp_size // self.dp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
         kv_args.decode_tp_size = attn_tp_size

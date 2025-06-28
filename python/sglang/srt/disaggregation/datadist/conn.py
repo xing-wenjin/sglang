@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 GUARD = "DataDistMsgGuard".encode("ascii")
 
+class DataDistKVArgs(KVArgs):
+    dp_rank: int
 
 @dataclasses.dataclass
 class TransferInfo:
@@ -108,14 +110,14 @@ TORCH_DTYPE_TO_NPU_DTYPE = {
 class DataDistKVManager(CommonKVManager):
     def __init__(
         self,
-        args: KVArgs,
+        args: DataDistKVArgs,
         disaggregation_mode: DisaggregationMode,
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.registered_kv_caches: List[Cache] = []
-        self.cluster_id = 0  # todo 根据dp_rank确定
+        self.cluster_id = args.dp_rank  # kv_manager initial stage set dp_rank from scheduler
         self.device_ip_list = get_device_ips()
         self.local_device_ip = self.device_ip_list[self.kv_args.gpu_id]
 
