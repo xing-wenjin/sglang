@@ -126,6 +126,7 @@ class DataDistKVManager(CommonKVManager):
         self.device_id = self.kv_args.gpu_id + self.kv_args.engine_rank
         self.cluster_id = self.device_id  # 保证clusterId不冲突，使用device_id
         self.local_device_ip = self.device_ip_list[self.device_id]
+        self.local_host_ip = get_local_ip_by_remote()
         # bootstrap_room到状态的映射
         # todo考虑request_status的线程安全问题
         self.request_status: Dict[int, int] = {}
@@ -138,7 +139,7 @@ class DataDistKVManager(CommonKVManager):
             "version": "1.0",
             "server_list": [
                 {
-                    "server_id": "node_0",
+                    "server_id": f"{self.local_host_ip}",
                     "device": [
                         {
                             "device_id": f"{self.device_id}",
@@ -152,7 +153,7 @@ class DataDistKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
             # p侧监听，D侧link_clusters
-            llm_config.listen_ip_info = f"{get_local_ip_by_remote()}:{26000 + self.kv_args.engine_rank}"
+            llm_config.listen_ip_info = f"{self.local_host_ip}:{26000 + self.kv_args.engine_rank}"
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.role = LLMRole.DECODER
         else:
@@ -240,7 +241,7 @@ class DataDistKVManager(CommonKVManager):
             self.link_registered = True
 
     def start_prefill_thread(self):
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.server_socket.bind(f"tcp://{self.local_host_ip}:{self.rank_port}")
 
         def bootstrap_thread():
             while True:
@@ -282,7 +283,7 @@ class DataDistKVManager(CommonKVManager):
         )
 
     def start_decode_thread(self):
-        self.server_socket.bind(f"tcp://{get_local_ip_by_remote()}:{self.rank_port}")
+        self.server_socket.bind(f"tcp://{self.local_host_ip}:{self.rank_port}")
 
         def decode_thread():
             while True:
@@ -395,7 +396,7 @@ class DataDistKVReceiver(CommonKVReceiver):
                 sock.send_multipart([
                     GUARD,
                     str(self.bootstrap_room).encode("ascii"),
-                    get_local_ip_by_remote().encode("ascii"),
+                    kv_mgr.local_host_ip.encode("ascii"),
                     str(kv_mgr.rank_port).encode("ascii"),
                     kv_indices.tobytes() if not is_dummy else b"",
                     str(aux_index).encode("ascii"),
