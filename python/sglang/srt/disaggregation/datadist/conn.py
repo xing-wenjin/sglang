@@ -383,6 +383,7 @@ class DataDistKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
         # 触发llm-datadist建链
         mgr.register_link(self.bootstrap_infos)
+        mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         kv_mgr: DataDistKVManager = self.kv_mgr
@@ -403,8 +404,6 @@ class DataDistKVReceiver(CommonKVReceiver):
                     str(self.required_dst_info_num).encode("ascii"),
                     str(kv_mgr.cluster_id).encode("ascii"),
                 ])
-
-        kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
