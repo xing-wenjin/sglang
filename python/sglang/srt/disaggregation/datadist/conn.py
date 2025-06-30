@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import logging
 import os
 import queue
@@ -48,6 +49,7 @@ class TransferInfo:
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
     required_dst_info_num: int
+    cluster_id: int
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
@@ -61,6 +63,7 @@ class TransferInfo:
             dst_kv_indices=np.frombuffer(msg[3], dtype=np.int32),
             dst_aux_index=int(msg[4].decode("ascii")),
             required_dst_info_num=int(msg[5].decode("ascii")),
+            cluster_id=int(msg[6].decode("ascii"))
         )
 
 
@@ -118,9 +121,10 @@ class DataDistKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.registered_kv_caches: List[Cache] = []
-        self.cluster_id = 0 if args.dp_rank is None else args.dp_rank  # kv_manager initial stage set dp_rank from scheduler
+        # self.cluster_id = 0 if args.dp_rank is None else args.dp_rank  # kv_manager initial stage set dp_rank from scheduler
         self.device_ip_list = get_device_ips()
         self.device_id = self.kv_args.gpu_id + self.kv_args.engine_rank
+        self.cluster_id = self.device_id  # 保证clusterId不冲突，使用device_id
         self.local_device_ip = self.device_ip_list[self.device_id]
         # bootstrap_room到状态的映射
         # todo考虑request_status的线程安全问题
@@ -129,10 +133,26 @@ class DataDistKVManager(CommonKVManager):
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
         llm_config.sync_kv_timeout = 20000
-        llm_config.enable_cache_manager = True
+        local_comm_res = {
+            "status": "completed",
+            "version": "1.0",
+            "server_list": [
+                {
+                    "server_id": "node_0",
+                    "device": [
+                        {
+                            "device_id": f"{self.device_id}",
+                            "device_ip": f"{self.local_device_ip}"
+                        }
+                    ]
+                }
+            ]
+        }
+        llm_config.local_comm_res = json.dumps(local_comm_res)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
-            llm_config.listen_ip_info = f"{self.local_device_ip}:26000"  # todo cacheManager场景下不需要
+            # p侧监听，D侧link_clusters
+            llm_config.listen_ip_info = f"{get_local_ip_by_remote()}:{26000 + self.kv_args.engine_rank}"
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.role = LLMRole.DECODER
         else:
@@ -174,10 +194,7 @@ class DataDistKVManager(CommonKVManager):
             data_type=TORCH_DTYPE_TO_NPU_DTYPE[self.kv_args.kv_data_first.dtype]
         )
         cache_addrs = self.kv_args.kv_data_ptrs
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            cache_key = BlocksCacheKey(self.cluster_id, 0)
-        else:
-            cache_key = None
+        cache_key = BlocksCacheKey(self.cluster_id, 0)
         self.registered_kv_caches.append(
             self.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
         )
@@ -190,10 +207,6 @@ class DataDistKVManager(CommonKVManager):
             data_type=TORCH_DTYPE_TO_NPU_DTYPE[output_ids.dtype]
         )
         cache_addrs = [output_ids.data_ptr()]
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            cache_key = BlocksCacheKey(self.cluster_id, 0)
-        else:
-            cache_key = None
         self.registered_kv_caches.append(
             self.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
         )
@@ -218,14 +231,12 @@ class DataDistKVManager(CommonKVManager):
         with self.register_link_lock:
             if self.link_registered:
                 return
-            cluster = llm_datadist.LLMClusterInfo()
-            cluster.remote_cluster_id = self.cluster_id
-            cluster.append_local_ip_info(self.local_device_ip, 0)
+            cluster_list = []
             for bootstrap_info in bootstrap_infos:
-                remote_device_id = bootstrap_info["gpu_id"] + bootstrap_info["engine_rank"]
-                remote_ip = self.device_ip_list[remote_device_id]
-                cluster.append_remote_ip_info(remote_ip, 26000)
-            self.llm_datadist.link_clusters([cluster], 20000)
+                cluster = llm_datadist.LLMClusterInfo()
+                cluster.append_remote_ip_info(bootstrap_info["rank_ip"], 26000 + bootstrap_info["engine_rank"])
+                cluster_list.append(cluster)
+            self.llm_datadist.link_clusters(cluster_list, 20000)
             self.link_registered = True
 
     def start_prefill_thread(self):
@@ -246,10 +257,10 @@ class DataDistKVManager(CommonKVManager):
 
                 required_dst_info_num = int(waiting_req_bytes[5].decode("ascii"))
                 room = int(room)
-                engine_rank = int(waiting_req_bytes[6].decode("ascii"))
+                cluster_id = int(waiting_req_bytes[6].decode("ascii"))
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
-                self.transfer_infos[room][engine_rank] = TransferInfo.from_zmq(waiting_req_bytes)
+                self.transfer_infos[room][cluster_id] = TransferInfo.from_zmq(waiting_req_bytes)
                 # 多个D对应一个P场景，等待D全部握手，开始传输
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     logger.debug(f"{room=} is bootstrapped")
@@ -309,8 +320,7 @@ class DataDistKVManager(CommonKVManager):
                 if req.is_dummy():
                     continue
                 chunked_dst_kv_indices = req.dst_kv_indices[index_slice]
-                decode_cache_key = BlocksCacheKey(self.cluster_id, 0)
-                # todo push_blocks接口没有参数填充D侧cacheId
+                decode_cache_key = BlocksCacheKey(req.cluster_id, 0)
                 self.cache_manager.push_blocks(
                     decode_cache_key,
                     self.registered_kv_caches[0],
@@ -372,7 +382,6 @@ class DataDistKVReceiver(CommonKVReceiver):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
         # 触发llm-datadist建链
         mgr.register_link(self.bootstrap_infos)
-        self.engine_rank = mgr.kv_args.engine_rank
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         kv_mgr: DataDistKVManager = self.kv_mgr
@@ -391,7 +400,7 @@ class DataDistKVReceiver(CommonKVReceiver):
                     kv_indices.tobytes() if not is_dummy else b"",
                     str(aux_index).encode("ascii"),
                     str(self.required_dst_info_num).encode("ascii"),
-                    str(self.engine_rank).encode("ascii"),
+                    str(kv_mgr.cluster_id).encode("ascii"),
                 ])
 
         kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
