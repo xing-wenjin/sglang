@@ -68,7 +68,7 @@ class CommonKVManager(BaseKVManager):
             ip_address = socket.gethostbyname(self.dist_init_addr.split(":")[0])
         else:
             ip_address = get_ip()
-
+        ip_address = "127.0.0.1"
         bootstrap_server_url = f"{ip_address}:{self.bootstrap_port}"
         url = f"http://{bootstrap_server_url}/route"
         payload = {

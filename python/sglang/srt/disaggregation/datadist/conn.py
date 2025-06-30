@@ -118,7 +118,7 @@ class DataDistKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.registered_kv_caches: List[Cache] = []
-        self.cluster_id = args.dp_rank  # kv_manager initial stage set dp_rank from scheduler
+        self.cluster_id = 0 if args.dp_rank is None else args.dp_rank  # kv_manager initial stage set dp_rank from scheduler
         self.device_ip_list = get_device_ips()
         self.device_id = self.kv_args.gpu_id + self.kv_args.engine_rank
         self.local_device_ip = self.device_ip_list[self.device_id]
@@ -283,7 +283,7 @@ class DataDistKVManager(CommonKVManager):
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
                         self.response_tracker[bootstrap_room].add(prefill_rank)
-                        expected_response_num = self.need_response_num
+                        expected_response_num = self.need_response_num[bootstrap_room]
                         arrived_response_num = len(self.response_tracker[bootstrap_room])
                         if (
                             self.is_mla_backend
