@@ -1,11 +1,11 @@
 import dataclasses
 import logging
 import os
+import queue
 import re
 import subprocess
 import threading
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, List, Set
 
 import llm_datadist
@@ -29,6 +29,15 @@ GUARD = "DataDistMsgGuard".encode("ascii")
 
 class DataDistKVArgs(KVArgs):
     dp_rank: int
+
+
+@dataclasses.dataclass
+class TransferKVChunk:
+    room: int
+    prefill_kv_indices: npt.NDArray[np.int32]
+    index_slice: slice
+    is_last: bool
+    prefill_aux_index: Optional[int]
 
 
 @dataclasses.dataclass
@@ -57,10 +66,12 @@ class TransferInfo:
 
 def get_device_ips():
     world_size = 8
-    npu_info = subprocess.run(['npu-smi', 'info', '-m'],
-                              stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE,
-                              universal_newlines=True)
+    npu_info = subprocess.run(
+        ['npu-smi', 'info', '-m'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
     hccn_path = '/usr/local/Ascend/driver/tools/hccn_tool'
     if npu_info.returncode != 0 or not os.path.exists(hccn_path):
         raise RuntimeError("no npu-smi/hccn tools provided for NPU.")
@@ -70,13 +81,13 @@ def get_device_ips():
     npu_start_idx = int(re_result.group(1))
     device_ip_list = []
     for ip_offset in range(world_size):
-        cmd = [
-            hccn_path, '-i', f'{npu_start_idx + ip_offset}', '-ip', '-g'
-        ]
-        device_ip_info = subprocess.run(cmd,
-                                        stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE,
-                                        universal_newlines=True)
+        cmd = [hccn_path, '-i', f'{npu_start_idx + ip_offset}', '-ip', '-g']
+        device_ip_info = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
         re_result = re.match(r'ipaddr:(.*)\n', device_ip_info.stdout)
         if re_result is None:
             raise RuntimeError("Can't find npu ip")
@@ -113,7 +124,7 @@ class DataDistKVManager(CommonKVManager):
         self.local_device_ip = self.device_ip_list[self.device_id]
         # bootstrap_room到状态的映射
         # todo考虑request_status的线程安全问题
-        self.request_status: Dict[int, KVPoll] = {}
+        self.request_status: Dict[int, int] = {}
         # 初始化datadist
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
@@ -122,15 +133,8 @@ class DataDistKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
             llm_config.listen_ip_info = f"{self.local_device_ip}:26000"  # todo cacheManager场景下不需要
-            self.transfer_infos: Dict[int, Dict[int, TransferInfo]] = {}  # room到D侧传输信息的映射
-            # 启动线程池异步传输kv_cache
-            # todo 是否需要考虑多核cpu并行
-            self.executor = ThreadPoolExecutor(max_workers=12)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.role = LLMRole.DECODER
-            # 用来接受prefill发送的完成状态
-            self.need_response_num: Dict[int, int] = {}
-            self.response_tracker: Dict[int, Set[int]] = defaultdict(set)
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -144,11 +148,19 @@ class DataDistKVManager(CommonKVManager):
         self.register_buffer_to_engine()
 
         self.server_socket = zmq.Context().socket(zmq.PULL)
-        # P侧创建zmq监听，接受D侧的握手信息
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.transfer_infos: Dict[int, Dict[int, TransferInfo]] = {}  # room到D侧传输信息的映射
+            # P侧创建zmq监听，接受D侧的握手信息
             self.start_prefill_thread()
-
+            # 启动多线程异步传输kv_cache，用队列保证请求处理的顺序性
+            queue_size = 12
+            self.transfer_queues = [queue.Queue() for _ in range(queue_size)]
+            for q in self.transfer_queues:
+                threading.Thread(target=self.transfer_worker, args=[q], daemon=True).start()
         if self.disaggregation_mode == DisaggregationMode.DECODE:
+            # 用来接受prefill发送的完成状态
+            self.need_response_num: Dict[int, int] = {}
+            self.response_tracker: Dict[int, Set[int]] = defaultdict(set)
             # D侧创建zmq监听接收P侧返回的传输完成消息
             self.start_decode_thread()
             self.register_link_lock = threading.Lock()
@@ -156,31 +168,40 @@ class DataDistKVManager(CommonKVManager):
 
     def register_buffer_to_engine(self):
         # todo 通过参数获取到shape和dtype
-        cache_desc = CacheDesc(num_tensors=len(self.kv_args.kv_data_ptrs),
-                               shape=tuple(self.kv_args.kv_data_first.shape),
-                               data_type=TORCH_DTYPE_TO_NPU_DTYPE[self.kv_args.kv_data_first.dtype])
+        cache_desc = CacheDesc(
+            num_tensors=len(self.kv_args.kv_data_ptrs),
+            shape=tuple(self.kv_args.kv_data_first.shape),
+            data_type=TORCH_DTYPE_TO_NPU_DTYPE[self.kv_args.kv_data_first.dtype]
+        )
         cache_addrs = self.kv_args.kv_data_ptrs
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             cache_key = BlocksCacheKey(self.cluster_id, 0)
         else:
             cache_key = None
-        self.registered_kv_caches.append(self.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key))
+        self.registered_kv_caches.append(
+            self.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
+        )
 
         # metadata aux只注册output_ids
         output_ids = self.kv_args.aux_datas[0]
-        cache_desc = CacheDesc(num_tensors=1, shape=tuple(output_ids.shape),
-                               data_type=TORCH_DTYPE_TO_NPU_DTYPE[output_ids.dtype])
+        cache_desc = CacheDesc(
+            num_tensors=1,
+            shape=tuple(output_ids.shape),
+            data_type=TORCH_DTYPE_TO_NPU_DTYPE[output_ids.dtype]
+        )
         cache_addrs = [output_ids.data_ptr()]
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             cache_key = BlocksCacheKey(self.cluster_id, 0)
         else:
             cache_key = None
-        self.registered_kv_caches.append(self.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key))
+        self.registered_kv_caches.append(
+            self.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
+        )
 
     def check_status(self, bootstrap_room: int):
         return self.request_status[bootstrap_room]
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
+    def update_status(self, bootstrap_room: int, status: int):
         if bootstrap_room not in self.request_status:
             self.request_status[bootstrap_room] = status
         else:
@@ -236,7 +257,7 @@ class DataDistKVManager(CommonKVManager):
 
         threading.Thread(target=bootstrap_thread).start()
 
-    def sync_status_to_decode_endpoint(
+    def sync_status_to_decode(
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         if ":" in remote:
@@ -254,9 +275,7 @@ class DataDistKVManager(CommonKVManager):
 
         def decode_thread():
             while True:
-                (bootstrap_room, status, prefill_rank) = (
-                    self.server_socket.recv_multipart()
-                )
+                bootstrap_room, status, prefill_rank = self.server_socket.recv_multipart()
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
@@ -276,55 +295,70 @@ class DataDistKVManager(CommonKVManager):
 
         threading.Thread(target=decode_thread).start()
 
-    def sync_transfer_request(self, bootstrap_room: int,
-                              kv_indices: npt.NDArray[np.int32],
-                              index_slice: slice,
-                              is_last: bool,
-                              aux_index: Optional[int] = None):
-        reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
-        for req in reqs_to_be_processed:
-            assert bootstrap_room == req.room
-            if req.is_dummy():
-                continue
-            chunked_dst_kv_indices = req.dst_kv_indices[index_slice]
-            assert len(chunked_dst_kv_indices) == len(kv_indices)
-            decode_cache_key = BlocksCacheKey(self.cluster_id, 0)
-            # todo push_blocks接口没有参数填充D侧cacheId
-            self.cache_manager.push_blocks(decode_cache_key,
-                                           self.registered_kv_caches[0],
-                                           kv_indices.tolist(),
-                                           chunked_dst_kv_indices.tolist()
-                                           )
+    def transfer_worker(self, q: queue.Queue):
+        while True:
+            kv_chunk: TransferKVChunk = q.get()
+            bootstrap_room = kv_chunk.room
+            index_slice = kv_chunk.index_slice
+            prefill_kv_indices = kv_chunk.prefill_kv_indices
+            is_last = kv_chunk.is_last
+            prefill_aux_index = kv_chunk.prefill_aux_index
 
-            # Only the last chunk we need to send the aux data.
-            if is_last:
-                assert aux_index is not None
-                # todo 发送失败的异常处理
-                self.cache_manager.push_blocks(decode_cache_key,
-                                               self.registered_kv_caches[1],
-                                               [aux_index],
-                                               [req.dst_aux_index]
-                                               )
-        if is_last:
-            # 全部发送完成，同步状态到decoder
-            self.update_status(bootstrap_room, KVPoll.Success)
+            reqs_to_be_processed = self.transfer_infos[bootstrap_room].values()
             for req in reqs_to_be_processed:
-                self.sync_status_to_decode_endpoint(
-                    req.endpoint, req.dst_port, req.room, KVPoll.Success, self.kv_args.engine_rank
+                if req.is_dummy():
+                    continue
+                chunked_dst_kv_indices = req.dst_kv_indices[index_slice]
+                decode_cache_key = BlocksCacheKey(self.cluster_id, 0)
+                # todo push_blocks接口没有参数填充D侧cacheId
+                self.cache_manager.push_blocks(
+                    decode_cache_key,
+                    self.registered_kv_caches[0],
+                    prefill_kv_indices.tolist(),
+                    chunked_dst_kv_indices.tolist()
                 )
-            del self.transfer_infos[bootstrap_room]
 
-    def add_transfer_request(self,
-                             bootstrap_room: int,
-                             kv_indices: npt.NDArray[np.int32],
-                             index_slice: slice,
-                             is_last: bool,
-                             aux_index: Optional[int] = None):
-        assert self.disaggregation_mode == DisaggregationMode.PREFILL
-        assert not is_last or (is_last and aux_index is not None)
-        # 异步发送kv_cache
-        self.executor.submit(
-            lambda: self.sync_transfer_request(bootstrap_room, kv_indices, index_slice, is_last, aux_index))
+                # Only the last chunk we need to send the aux data.
+                if is_last:
+                    # todo 发送失败的异常处理
+                    self.cache_manager.push_blocks(
+                        decode_cache_key,
+                        self.registered_kv_caches[1],
+                        [prefill_aux_index],
+                        [req.dst_aux_index]
+                    )
+            if is_last:
+                # 全部发送完成，同步状态到decoder
+                self.update_status(bootstrap_room, KVPoll.Success)
+                for req in reqs_to_be_processed:
+                    self.sync_status_to_decode(
+                        req.endpoint,
+                        req.dst_port,
+                        req.room,
+                        KVPoll.Success,
+                        self.kv_args.engine_rank
+                    )
+                del self.transfer_infos[bootstrap_room]
+
+    def add_transfer_request(
+        self,
+        bootstrap_room: int,
+        kv_indices: npt.NDArray[np.int32],
+        index_slice: slice,
+        is_last: bool,
+        aux_index: Optional[int] = None
+    ):
+        assert bootstrap_room in self.transfer_infos
+        queue_index = bootstrap_room % len(self.transfer_queues)
+        self.transfer_queues[queue_index].put(
+            TransferKVChunk(
+                room=bootstrap_room,
+                prefill_kv_indices=kv_indices,
+                index_slice=index_slice,
+                is_last=is_last,
+                prefill_aux_index=aux_index,
+            )
+        )
 
 
 class DataDistKVReceiver(CommonKVReceiver):
@@ -344,9 +378,7 @@ class DataDistKVReceiver(CommonKVReceiver):
         kv_mgr: DataDistKVManager = self.kv_mgr
         kv_mgr.need_response_num[self.bootstrap_room] = len(self.bootstrap_infos)  # 记录D侧需要P侧响应的个数
         for bootstrap_info in self.bootstrap_infos:
-            prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
-            )
+            prefill_server_url = f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
             is_dummy = bootstrap_info["is_dummy"]
             sock, lock = self._connect("tcp://" + prefill_server_url)
 
@@ -383,11 +415,18 @@ class DataDistKVReceiver(CommonKVReceiver):
 
 
 class DataDistKVSender(BaseKVSender):
-    def __init__(self, mgr: DataDistKVManager, bootstrap_addr: str, bootstrap_room: int, dest_tp_ranks: List[int],
-                 pp_rank: int):
+    def __init__(
+        self,
+        mgr: DataDistKVManager,
+        bootstrap_addr: str,
+        bootstrap_room: int,
+        dest_tp_ranks: List[int],
+        pp_rank: int
+    ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
         self.aux_index = None
+        self.num_kv_indices = None
         self.bootstrap_server_url = bootstrap_addr
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         self.curr_idx = 0
