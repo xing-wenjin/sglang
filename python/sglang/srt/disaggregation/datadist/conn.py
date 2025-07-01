@@ -79,7 +79,7 @@ def get_device_info(device_id):
     if npu_info.returncode != 0 or not os.path.exists(hccn_path):
         raise RuntimeError("no npu-smi/hccn tools provided for NPU.")
     device_infos = [line.split(' ') for line in npu_info.stdout.splitlines()]
-    info =  device_infos[device_id]
+    info = device_infos[device_id]
     # info: npuId, chipId, deviceId, deviceIp, super_device_id, super_pod_id
     device_ip_info = subprocess.run(
         [hccn_path, '-i', f'{info[2]}', '-ip', '-g'],
