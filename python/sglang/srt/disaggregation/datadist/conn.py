@@ -67,7 +67,7 @@ class TransferInfo:
         )
 
 
-def get_device_infos():
+def get_device_info(device_id):
     npu_info = subprocess.run(
         ["npu-smi info -m | awk '{if ($3 ~ /[0-9]+/) print $1, $2, $3}'"],
         shell=True,
@@ -79,47 +79,40 @@ def get_device_infos():
     if npu_info.returncode != 0 or not os.path.exists(hccn_path):
         raise RuntimeError("no npu-smi/hccn tools provided for NPU.")
     device_infos = [line.split(' ') for line in npu_info.stdout.splitlines()]
-    for info in device_infos:
-        # info: npuId, chipId, deviceId, deviceIp, super_device_id, super_pod_id
-        device_ip_info = subprocess.run(
-            [hccn_path, '-i', f'{info[2]}', '-ip', '-g'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-        re_result = re.match(r'ipaddr:(.*)\n', device_ip_info.stdout)
-        if re_result is None:
-            raise RuntimeError("Can't find npu ip")
-        device_ip = re_result.group(1)
-        info.append(device_ip)
-        pod_info = subprocess.run(
-            [f"npu-smi info -t spod-info -i {info[0]} -c {info[1]}"],
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
-        re_result = re.search(r'SDID *: (\d+)', pod_info.stdout)
-        if re_result is None:
-            raise RuntimeError("Can't find super device id")
-        super_device_id = re_result.group(1)
-        re_result = re.search(r'Super Pod ID *: (\d+)', pod_info.stdout)
-        if re_result is None:
-            raise RuntimeError("Can't find super pod id")
-        super_pod_id = re_result.group(1)
-        info.extend([super_device_id, super_pod_id])
-    return device_infos
+    info =  device_infos[device_id]
+    # info: npuId, chipId, deviceId, deviceIp, super_device_id, super_pod_id
+    device_ip_info = subprocess.run(
+        [hccn_path, '-i', f'{info[2]}', '-ip', '-g'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+    re_result = re.match(r'ipaddr:(.*)\n', device_ip_info.stdout)
+    if re_result is None:
+        raise RuntimeError("Can't find npu ip")
+    device_ip = re_result.group(1)
+    info.append(device_ip)
+    pod_info = subprocess.run(
+        [f"npu-smi info -t spod-info -i {info[0]} -c {info[1]}"],
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True
+    )
+    re_result = re.search(r'SDID *: (\d+)', pod_info.stdout)
+    if re_result is None:
+        raise RuntimeError("Can't find super device id")
+    super_device_id = re_result.group(1)
+    re_result = re.search(r'Super Pod ID *: (\d+)', pod_info.stdout)
+    if re_result is None:
+        raise RuntimeError("Can't find super pod id")
+    super_pod_id = re_result.group(1)
+    info.extend([super_device_id, super_pod_id])
+    return info
 
 
-def generate_rank_table_a3():
-    device_infos = get_device_infos()
-    device_list = [
-        {
-            "device_id": f"{info[2]}",
-            "super_device_id": f"{info[4]}",
-            "device_ip": f"{info[3]}"
-        } for info in device_infos
-    ]
+def generate_rank_table_a3(device_id):
+    device_info = get_device_info(device_id)
     rank_info = {
         "status": "completed",
         "version": "1.2",
@@ -127,19 +120,25 @@ def generate_rank_table_a3():
         "server_list": [
             {
                 "server_id": "node_0",
-                "device": device_list
+                "device": [
+                    {
+                        "device_id": f"{device_info[2]}",
+                        "super_device_id": f"{device_info[4]}",
+                        "device_ip": f"{device_info[3]}"
+                    }
+                ]
             }
         ],
         "super_pod_list": [
             {
-                "super_pod_id": f"{device_infos[0][5]}",
+                "super_pod_id": f"{device_info[5]}",
                 "server_list": [
                     {"server_id": "node_0"}
                 ]
             }
         ]
     }
-    return rank_info
+    return json.dumps(rank_info)
 
 
 TORCH_DTYPE_TO_NPU_DTYPE = {
@@ -175,9 +174,7 @@ class DataDistKVManager(CommonKVManager):
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
         llm_config.sync_kv_timeout = 20000
-        rank_table = generate_rank_table_a3()
-        rank_table["server_list"][0]["device"] = [rank_table["server_list"][0]["device"][self.device_id]]
-        llm_config.local_comm_res = json.dumps(rank_table)
+        llm_config.local_comm_res = generate_rank_table_a3(self.device_id)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
             # p侧监听，D侧link_clusters
