@@ -67,10 +67,10 @@ class TransferInfo:
         )
 
 
-def get_device_ips():
-    world_size = 8
+def get_device_infos():
     npu_info = subprocess.run(
-        ['npu-smi', 'info', '-m'],
+        ["npu-smi info -m | awk '{if ($3 ~ /[0-9]+/) print $1, $2, $3}'"],
+        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         universal_newlines=True
@@ -78,15 +78,11 @@ def get_device_ips():
     hccn_path = '/usr/local/Ascend/driver/tools/hccn_tool'
     if npu_info.returncode != 0 or not os.path.exists(hccn_path):
         raise RuntimeError("no npu-smi/hccn tools provided for NPU.")
-    re_result = re.match(r'.*\n\t([0-9]+).*', npu_info.stdout)
-    if re_result is None:
-        raise RuntimeError("Can't find npu start index")
-    npu_start_idx = int(re_result.group(1))
-    device_ip_list = []
-    for ip_offset in range(world_size):
-        cmd = [hccn_path, '-i', f'{npu_start_idx + ip_offset}', '-ip', '-g']
+    device_infos = [line.split(' ') for line in npu_info.stdout.splitlines()]
+    for info in device_infos:
+        # info: npuId, chipId, deviceId, deviceIp, super_device_id, super_pod_id
         device_ip_info = subprocess.run(
-            cmd,
+            [hccn_path, '-i', f'{info[2]}', '-ip', '-g'],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True
@@ -95,8 +91,55 @@ def get_device_ips():
         if re_result is None:
             raise RuntimeError("Can't find npu ip")
         device_ip = re_result.group(1)
-        device_ip_list.append(device_ip)
-    return device_ip_list
+        info.append(device_ip)
+        pod_info = subprocess.run(
+            [f"npu-smi info -t spod-info -i {info[0]} -c {info[1]}"],
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        re_result = re.search(r'SDID *: (\d+)', pod_info.stdout)
+        if re_result is None:
+            raise RuntimeError("Can't find super device id")
+        super_device_id = re_result.group(1)
+        re_result = re.search(r'Super Pod ID *: (\d+)', pod_info.stdout)
+        if re_result is None:
+            raise RuntimeError("Can't find super pod id")
+        super_pod_id = re_result.group(1)
+        info.extend([super_device_id, super_pod_id])
+    return device_infos
+
+
+def generate_rank_table_a3():
+    device_infos = get_device_infos()
+    device_list = [
+        {
+            "device_id": f"{info[2]}",
+            "super_device_id": f"{info[4]}",
+            "device_ip": f"{info[3]}"
+        } for info in device_infos
+    ]
+    rank_info = {
+        "status": "completed",
+        "version": "1.2",
+        "server_count": "1",
+        "server_list": [
+            {
+                "server_id": "node_0",
+                "device": device_list
+            }
+        ],
+        "super_pod_list": [
+            {
+                "super_pod_id": f"{device_infos[0][5]}",
+                "server_list": [
+                    {"server_id": "node_0"}
+                ]
+            }
+        ]
+    }
+    return json.dumps(rank_info)
 
 
 TORCH_DTYPE_TO_NPU_DTYPE = {
@@ -122,10 +165,8 @@ class DataDistKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.registered_kv_caches: List[Cache] = []
         # self.cluster_id = 0 if args.dp_rank is None else args.dp_rank  # kv_manager initial stage set dp_rank from scheduler
-        self.device_ip_list = get_device_ips()
         self.device_id = self.kv_args.gpu_id + self.kv_args.engine_rank
         self.cluster_id = self.device_id  # 保证clusterId不冲突，使用device_id
-        self.local_device_ip = self.device_ip_list[self.device_id]
         self.local_host_ip = get_local_ip_by_remote()
         # bootstrap_room到状态的映射
         # todo考虑request_status的线程安全问题
@@ -134,22 +175,7 @@ class DataDistKVManager(CommonKVManager):
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
         llm_config.sync_kv_timeout = 20000
-        local_comm_res = {
-            "status": "completed",
-            "version": "1.0",
-            "server_list": [
-                {
-                    "server_id": f"{self.local_host_ip}",
-                    "device": [
-                        {
-                            "device_id": f"{self.device_id}",
-                            "device_ip": f"{self.local_device_ip}"
-                        }
-                    ]
-                }
-            ]
-        }
-        llm_config.local_comm_res = json.dumps(local_comm_res)
+        llm_config.local_comm_res = generate_rank_table_a3()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
             # p侧监听，D侧link_clusters
