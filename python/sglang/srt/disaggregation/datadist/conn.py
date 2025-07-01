@@ -139,7 +139,7 @@ def generate_rank_table_a3():
             }
         ]
     }
-    return json.dumps(rank_info)
+    return rank_info
 
 
 TORCH_DTYPE_TO_NPU_DTYPE = {
@@ -175,7 +175,9 @@ class DataDistKVManager(CommonKVManager):
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
         llm_config.sync_kv_timeout = 20000
-        llm_config.local_comm_res = generate_rank_table_a3()
+        rank_table = generate_rank_table_a3()
+        rank_table["server_list"][0]["device"] = [rank_table["server_list"][0]["device"][self.device_id]]
+        llm_config.local_comm_res = json.dumps(rank_table)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
             # p侧监听，D侧link_clusters
