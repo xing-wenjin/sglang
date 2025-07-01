@@ -94,7 +94,7 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
-        device = "cuda" if self.custom_mem_pool else "cpu"
+        device = "cuda" if self.custom_mem_pool else "npu"
 
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
