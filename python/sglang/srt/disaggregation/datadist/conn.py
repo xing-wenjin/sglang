@@ -236,6 +236,7 @@ class DataDistKVManager(CommonKVManager):
             data_type=TORCH_DTYPE_TO_NPU_DTYPE[output_ids.dtype]
         )
         cache_addrs = [output_ids.data_ptr()]
+        cache_key = BlocksCacheKey(self.cluster_id, 1)
         self.registered_kv_caches.append(
             self.cache_manager.register_blocks_cache(cache_desc, cache_addrs, cache_key)
         )
@@ -360,6 +361,7 @@ class DataDistKVManager(CommonKVManager):
                 # Only the last chunk we need to send the aux data.
                 if is_last:
                     # todo 发送失败的异常处理
+                    decode_cache_key = BlocksCacheKey(req.cluster_id, 1)
                     self.cache_manager.push_blocks(
                         decode_cache_key,
                         self.registered_kv_caches[1],
