@@ -355,7 +355,9 @@ class DataDistKVManager(CommonKVManager):
                     decode_cache_key,
                     self.registered_kv_caches[0],
                     prefill_kv_indices.tolist(),
-                    chunked_dst_kv_indices.tolist()
+                    chunked_dst_kv_indices.tolist(),
+                    range(len(self.kv_args.kv_data_ptrs)),
+                    range(len(self.kv_args.kv_data_ptrs))
                 )
 
                 # Only the last chunk we need to send the aux data.
@@ -366,7 +368,9 @@ class DataDistKVManager(CommonKVManager):
                         decode_cache_key,
                         self.registered_kv_caches[1],
                         [prefill_aux_index],
-                        [req.dst_aux_index]
+                        [req.dst_aux_index],
+                        range(1),
+                        range(1)
                     )
             if is_last:
                 # 全部发送完成，同步状态到decoder
