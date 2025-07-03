@@ -3,7 +3,6 @@ from typing import Callable, List, Optional, Tuple
 
 import einops
 import torch
-from sgl_kernel import silu_and_mul
 from torch.nn import Module
 
 from sglang.srt.custom_op import CustomOp
@@ -48,6 +47,7 @@ from sglang.srt.utils import (
     DeepEPMode,
     dispose_tensor,
     get_bool_env_var,
+    is_cuda,
     is_hip,
     set_weight_attrs,
 )
@@ -55,6 +55,9 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and is_cuda():
+    from sgl_kernel import silu_and_mul
 
 if _is_hip:
     from vllm._custom_ops import scaled_fp8_quant

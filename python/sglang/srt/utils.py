@@ -2439,8 +2439,8 @@ def bind_or_assign(target, source):
         return source
 
 
-def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+def support_triton(attn_backend: str) -> bool:
+    return attn_backend not in ["torch_native", "intel_amx", "npumla"]
 
 
 try:
