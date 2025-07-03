@@ -169,6 +169,7 @@ class DecodePreallocQueue:
         self.tp_size = tp_size
         self.dp_size = dp_size
         self.gpu_id = gpu_id
+        self.dp_rank = scheduler.dp_rank
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.prefill_pp_size = prefill_pp_size
@@ -184,6 +185,9 @@ class DecodePreallocQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
+        # pass dp_rank in kv_manager initialization
+        if self.transfer_backend == TransferBackend.LLMDATADIST:
+            kv_args.dp_rank = self.dp_rank
         attn_tp_size = self.tp_size // self.dp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
         kv_args.decode_tp_size = attn_tp_size
@@ -191,6 +195,7 @@ class DecodePreallocQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
+        kv_args.kv_data_first = self.token_to_kv_pool.get_key_buffer(0)
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -208,6 +213,7 @@ class DecodePreallocQueue:
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
         )
+        kv_args.aux_datas = self.metadata_buffers.get_bufs()
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
