@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
+import torch
 
 from sglang.srt.server_args import ServerArgs
 
@@ -14,9 +15,11 @@ if TYPE_CHECKING:
 
 class KVArgs:
     engine_rank: int
+    kv_data_first: torch.Tensor
     kv_data_ptrs: List[int]
     kv_data_lens: List[int]
     kv_item_lens: List[int]
+    aux_datas: List[torch.Tensor]
     aux_data_ptrs: List[int]
     aux_data_lens: List[int]
     aux_item_lens: List[int]
