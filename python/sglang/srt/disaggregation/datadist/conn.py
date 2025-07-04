@@ -163,8 +163,7 @@ class DataDistKVManager(CommonKVManager):
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.registered_kv_caches: List[Cache] = []
-        # self.cluster_id = 0 if args.dp_rank is None else args.dp_rank  # kv_manager initial stage set dp_rank from scheduler
-        self.device_id = self.kv_args.gpu_id + self.kv_args.engine_rank
+        self.device_id = self.kv_args.gpu_id
         self.cluster_id = self.device_id  # 保证clusterId不冲突，使用device_id
         self.local_host_ip = get_local_ip_by_remote()
         # bootstrap_room到状态的映射
@@ -210,7 +209,7 @@ class DataDistKVManager(CommonKVManager):
             # D侧创建zmq监听接收P侧返回的传输完成消息
             self.start_decode_thread()
             self.register_link_lock = threading.Lock()
-            self.link_registered = False
+            self.link_clusters_dict = {}
 
     def register_buffer_to_engine(self):
         # todo 通过参数获取到shape和dtype
@@ -253,18 +252,20 @@ class DataDistKVManager(CommonKVManager):
                     self.request_status[bootstrap_room], status
                 )
 
-    def register_link(self, bootstrap_infos):
+    def register_link(self, link_register_key, bootstrap_infos):
         # receiver触发建链，只用建一次
         with self.register_link_lock:
-            if self.link_registered:
+            if link_register_key in self.link_clusters_dict:
                 return
             cluster_list = []
             for bootstrap_info in bootstrap_infos:
                 cluster = llm_datadist.LLMClusterInfo()
                 cluster.append_remote_ip_info(bootstrap_info["rank_ip"], 26000 + bootstrap_info["engine_rank"])
                 cluster_list.append(cluster)
-            self.llm_datadist.link_clusters(cluster_list, 20000)
-            self.link_registered = True
+            ret, rets = self.llm_datadist.link_clusters(cluster_list, 20000)
+            if ret != llm_datadist.LLMStatusCode.LLM_SUCCESS:
+                raise Exception(f"link cluster failure {ret} {rets}")
+            self.link_clusters_dict[link_register_key] = cluster_list
 
     def start_prefill_thread(self):
         self.server_socket.bind(f"tcp://{self.local_host_ip}:{self.rank_port}")
@@ -413,7 +414,8 @@ class DataDistKVReceiver(CommonKVReceiver):
     ):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, data_parallel_rank)
         # 触发llm-datadist建链
-        mgr.register_link(self.bootstrap_infos)
+        link_register_key = f"{self.bootstrap_addr}_{self.target_dp_group}"
+        mgr.register_link(link_register_key, self.bootstrap_infos)
         mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
