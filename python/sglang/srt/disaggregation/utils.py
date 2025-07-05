@@ -15,8 +15,9 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import get_ip
+from sglang.srt.utils import get_ip, is_npu
 
+_is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -74,7 +75,7 @@ class ReqToMetadataIdxAllocator:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self) -> List[int]:
+    def alloc(self) -> Optional[int]:
         if len(self.free_slots) == 0:
             return None
 
@@ -94,8 +95,12 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
-        device = "cuda" if self.custom_mem_pool else "npu"
-
+        device = "cpu"
+        if _is_npu:
+            # We need set output tokens to ascend device in order to transfer by D2D channel.
+            device = "npu"
+        elif self.custom_mem_pool:
+            device = "cuda"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -150,16 +155,6 @@ class MetadataBuffers:
         ]
         return ptrs, data_lens, item_lens
 
-    def get_bufs(self):
-        return (
-            self.output_ids,
-            self.output_token_logprobs_val,
-            self.output_token_logprobs_idx,
-            self.output_top_logprobs_val,
-            self.output_top_logprobs_idx,
-            self.output_hidden_states,
-        )
-
     def get_buf(self, idx: int):
         return (
             self.output_ids[idx],
@@ -210,7 +205,7 @@ class MetadataBuffers:
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
-    LLMDATADIST = "llm-datadist"
+    ASCEND = "ascend"
     FAKE = "fake"
 
 
@@ -242,6 +237,23 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             KVClassType.BOOTSTRAP_SERVER: MooncakeKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+    elif transfer_backend == TransferBackend.ASCEND:
+        from sglang.srt.disaggregation.ascend import (
+            AscendKVBootstrapServer,
+            AscendKVManager,
+            AscendKVReceiver,
+            AscendKVSender,
+        )
+        from sglang.srt.disaggregation.base import KVArgs
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: AscendKVManager,
+            KVClassType.SENDER: AscendKVSender,
+            KVClassType.RECEIVER: (AscendKVReceiver),
+            KVClassType.BOOTSTRAP_SERVER: AscendKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
     elif transfer_backend == TransferBackend.NIXL:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.nixl import (
@@ -259,26 +271,6 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
-
-    elif transfer_backend == TransferBackend.LLMDATADIST:
-        from sglang.srt.disaggregation.base import KVArgs
-        from sglang.srt.disaggregation.datadist import (
-            DataDistKVArgs,
-            DataDistKVManager,
-            DataDistKVSender,
-            DataDistKVReceiver,
-            DataDistKVBootstrapServer,
-        )
-
-        class_mapping = {
-            KVClassType.KVARGS: DataDistKVArgs,
-            KVClassType.MANAGER: DataDistKVManager,
-            KVClassType.SENDER: DataDistKVSender,
-            KVClassType.RECEIVER: DataDistKVReceiver,
-            KVClassType.BOOTSTRAP_SERVER: DataDistKVBootstrapServer,
-        }
-        return class_mapping.get(class_type)
-
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
