@@ -119,7 +119,7 @@ def generate_rank_table_a3(device_id):
         "server_count": "1",
         "server_list": [
             {
-                "server_id": "node_0",
+                "server_id": f"{get_local_ip_by_remote()}",
                 "device": [
                     {
                         "device_id": f"{device_info[2]}",
@@ -133,7 +133,7 @@ def generate_rank_table_a3(device_id):
             {
                 "super_pod_id": f"{device_info[5]}",
                 "server_list": [
-                    {"server_id": "node_0"}
+                    {"server_id": f"{get_local_ip_by_remote()}"}
                 ]
             }
         ]
