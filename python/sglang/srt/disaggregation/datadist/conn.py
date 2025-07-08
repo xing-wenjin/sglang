@@ -177,10 +177,11 @@ class DataDistKVManager(CommonKVManager):
         llm_config.sync_kv_timeout = 20000
         llm_config.local_comm_res = generate_rank_table_a3(self.device_id)
         print("fengye rank table is", llm_config.local_comm_res)
+        self.server_args = server_args
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
             # p侧监听，D侧link_clusters
-            llm_config.listen_ip_info = f"{self.local_host_ip}:{26000 + self.kv_args.engine_rank}"
+            llm_config.listen_ip_info = f"{self.local_host_ip}:{26000 + self.kv_args.gpu_id - server_args.base_gpu_id}"
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.role = LLMRole.DECODER
         else:
@@ -204,8 +205,7 @@ class DataDistKVManager(CommonKVManager):
             # 启动多线程异步传输kv_cache，用队列保证请求处理的顺序性
             queue_size = 12
             self.transfer_queues = [queue.Queue() for _ in range(queue_size)]
-            for q in self.transfer_queues:
-                threading.Thread(target=self.transfer_worker, args=[q], daemon=True).start()
+            [threading.Thread(target=self.transfer_worker, args=[q], daemon=True).start() for q in self.transfer_queues]
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # 用来接受prefill发送的完成状态
             self.need_response_num: Dict[int, int] = {}
@@ -268,7 +268,9 @@ class DataDistKVManager(CommonKVManager):
                 print("fengye register link for rank ip %s, engine rank %d, key %s"
                       % (bootstrap_info["rank_ip"], bootstrap_info["engine_rank"], link_register_key))
                 cluster = llm_datadist.LLMClusterInfo()
-                cluster.append_remote_ip_info(bootstrap_info["rank_ip"], 26000 + bootstrap_info["engine_rank"])
+                cluster.append_remote_ip_info(
+                    bootstrap_info["rank_ip"], 26000 + bootstrap_info["gpu_id"] - self.server_args.base_gpu_id
+                )
                 cluster_list.append(cluster)
             ret, rets = self.llm_datadist.link_clusters(cluster_list, 20000)
             if ret != llm_datadist.LLMStatusCode.LLM_SUCCESS:
