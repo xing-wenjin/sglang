@@ -175,7 +175,7 @@ class RotaryEmbedding(CustomOp):
         """A PyTorch-npu implementation of forward()."""
         import os
 
-        if get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE"):
+        if 1:
             return self.forward_native(positions, query, key, offsets)
         else:
             rotary_mode = "half"

@@ -56,7 +56,7 @@ class NpuMLADecodeMetadata:
         self.num_splits = num_splits
         self.block_kv_indices = block_kv_indices
         self.seq_lens_list = seq_lens_list if seq_lens_list is not None else [1]
-        self.seq_lens_list_cussum = np.cumsum(self.seq_lens_list).tolist() 
+        self.seq_lens_list_cussum = np.cumsum(self.seq_lens_list).tolist()
 
 class NpuMLAIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
@@ -194,7 +194,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if 1:
             if False:
                 block_kv_indices = self.indices_updater_decode.update(
                     forward_batch.req_pool_indices,
