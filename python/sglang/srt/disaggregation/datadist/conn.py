@@ -108,11 +108,11 @@ def get_device_info(device_id):
         raise RuntimeError("Can't find super pod id")
     super_pod_id = re_result.group(1)
     info.extend([super_device_id, super_pod_id])
-    return info
+    return info, len(device_infos)
 
 
 def generate_rank_table_a3(device_id):
-    device_info = get_device_info(device_id)
+    device_info, device_count = get_device_info(device_id)
     rank_info = {
         "status": "completed",
         "version": "1.2",
@@ -138,7 +138,7 @@ def generate_rank_table_a3(device_id):
             }
         ]
     }
-    return json.dumps(rank_info)
+    return json.dumps(rank_info), device_count
 
 
 TORCH_DTYPE_TO_NPU_DTYPE = {
@@ -164,7 +164,6 @@ class DataDistKVManager(CommonKVManager):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
         self.registered_kv_caches: List[Cache] = []
         self.device_id = self.kv_args.gpu_id
-        self.cluster_id = self.device_id  # 保证clusterId不冲突，使用device_id
         self.local_host_ip = get_local_ip_by_remote()
         print("fengye gpu_id %d, engine_rank %d, hostip %s " %
               (self.kv_args.gpu_id, self.kv_args.engine_rank, self.local_host_ip))
@@ -175,7 +174,10 @@ class DataDistKVManager(CommonKVManager):
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
         llm_config.sync_kv_timeout = 20000
-        llm_config.local_comm_res = generate_rank_table_a3(self.device_id)
+        rank_table, self.world_size = generate_rank_table_a3(self.device_id)
+        llm_config.local_comm_res = rank_table
+        # 加上个node_rank偏移保证cluster_id不冲突
+        self.cluster_id = self.device_id + self.world_size * ServerArgs.node_rank
         print("fengye rank table is", llm_config.local_comm_res)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
@@ -183,11 +185,12 @@ class DataDistKVManager(CommonKVManager):
             llm_config.listen_ip_info = f"{self.local_host_ip}:{26000 + self.kv_args.gpu_id}"
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.role = LLMRole.DECODER
+            self.cluster_id += self.world_size * ServerArgs.nnodes
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
-        print("fengye init datadist")
+        print("fengye init datadist cluster id", self.cluster_id)
         self.llm_datadist = LLMDataDist(self.role, self.cluster_id)
         engine_options = llm_config.generate_options()
         self.llm_datadist.init(engine_options)
