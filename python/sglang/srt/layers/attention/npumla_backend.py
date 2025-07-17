@@ -194,7 +194,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if 1:
             if False:
                 block_kv_indices = self.indices_updater_decode.update(
                     forward_batch.req_pool_indices,

@@ -356,7 +356,7 @@ class ServerArgs:
             logger.warning(
                 "Cutlass MLA and NpuMLA only support a page_size of 128, change page_size to 128."
             )
-            self.page_size = 128
+            self.page_size = 1
 
         # Set kernel backends for hpu device
         if self.device == "hpu":
