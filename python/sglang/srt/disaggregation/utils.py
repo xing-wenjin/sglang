@@ -15,7 +15,7 @@ import requests
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import get_ip
+from sglang.srt.utils import get_ip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -94,8 +94,10 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.buffer_size = size
         device = "cuda" if self.custom_mem_pool else "cpu"
-
+        if is_npu():
+            device = "npu"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -150,6 +152,9 @@ class MetadataBuffers:
         ]
         return ptrs, data_lens, item_lens
 
+    def get_buffer_size(self):
+        return self.buffer_size
+
     def get_buf(self, idx: int):
         return (
             self.output_ids[idx],
@@ -200,6 +205,7 @@ class MetadataBuffers:
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
+    LLMDATADIST = "llm-datadist"
     FAKE = "fake"
 
 
@@ -248,6 +254,25 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+
+    elif transfer_backend == TransferBackend.LLMDATADIST:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.datadist import (
+            DataDistKVManager,
+            DataDistKVSender,
+            DataDistKVReceiver,
+            DataDistKVBootstrapServer,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: DataDistKVManager,
+            KVClassType.SENDER: DataDistKVSender,
+            KVClassType.RECEIVER: DataDistKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: DataDistKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
