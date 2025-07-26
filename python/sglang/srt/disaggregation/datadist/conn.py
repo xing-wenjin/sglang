@@ -171,6 +171,9 @@ class DataDistKVManager(CommonKVManager):
         self.local_host_ip = get_local_ip_by_remote()
         # bootstrap_room到状态的映射
         self.request_status: Dict[int, int] = {}
+        self.args = args
+        self.server_args = server_args
+        self.is_mla_backend = is_mla_backend
         # 初始化datadist
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
@@ -226,9 +229,14 @@ class DataDistKVManager(CommonKVManager):
             self.link_clusters_dict = {}
 
     def register_buffer_to_engine(self):
+        shape = self.kv_args.kv_data_shape
+        # mla_backend, shape should be modified by page_size
+        if self.is_mla_backend:
+            dim0, dim2 = shape[0], shape[2]
+            shape = torch.Size((dim0 // self.args.page_size, self.args.page_size, dim2))
         cache_desc = CacheDesc(
             num_tensors=len(self.kv_args.kv_data_ptrs),
-            shape=tuple(self.kv_args.kv_data_shape),
+            shape=tuple(shape),
             data_type=TORCH_DTYPE_TO_NPU_DTYPE[self.kv_args.kv_data_dtype],
         )
         cache_addrs = self.kv_args.kv_data_ptrs
