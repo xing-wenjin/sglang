@@ -231,7 +231,7 @@ class MoEGate(nn.Module):
         self,
         config,
         prefix: str = "",
-        predefined_zeros_npu: torch.Tensor = None
+        predefined_zeros_npu: torch.Tensor = None,
         is_nextn: bool = False,
     ):
         super().__init__()
